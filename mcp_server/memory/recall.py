@@ -11,6 +11,8 @@ from typing import Any
 import numpy as np
 
 from .embedder import Embedder
+from .licence import effective_licence
+from .provenance import effective_provenance
 from .lifecycle import MemoryLifecycle, MemoryState
 from .query_expansion import expand_query
 from .store import ValkeyStore
@@ -47,31 +49,164 @@ _PROJECT_FILTER_FIELDS = {
 }
 
 
-def _build_filter_expr(namespace: str, project_filter: str | None) -> str:
-    """Compose the FT.SEARCH filter for one namespace."""
+def normalise_project_filter(project_filter: Any) -> list[str]:
+    """Accept a single project or a list of them, and return a clean list.
+
+    A domain filter resolves to several projects (v6.6), so every project-
+    scoped path takes a list internally. A bare string still works and is the
+    common case, so callers were not changed.
+    """
+    if not project_filter:
+        return []
+    if isinstance(project_filter, str):
+        candidates = [project_filter]
+    else:
+        candidates = [p for p in project_filter if isinstance(p, str)]
+    out: list[str] = []
+    for name in candidates:
+        name = name.strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def _build_filter_expr(namespace: str, project_filter: Any) -> str:
+    """Compose the FT.SEARCH filter for one namespace.
+
+    With more than one project the clauses are OR'd at clause level rather
+    than with in-brace alternation — `@project:{a|b}` returns an empty set on
+    valkey-search (verified live; see the graveyard). Only values matching the
+    tag allowlist are pushed down; anything else is left to the Python-side
+    filter, and a filter that covers only part of the requested set would be
+    wrong, so a single unsafe value drops push-down for the whole clause.
+    """
     clauses = [_STATE_FILTER]
-    if project_filter and _TAG_VALUE_SAFE_RE.match(project_filter):
+    projects = normalise_project_filter(project_filter)
+    if projects:
         tag_field = _PROJECT_FILTER_FIELDS.get(namespace)
-        if tag_field:
-            clauses.append(f"@{tag_field}:{{{project_filter}}}")
+        if tag_field and all(_TAG_VALUE_SAFE_RE.match(p) for p in projects):
+            if len(projects) == 1:
+                clauses.append(f"@{tag_field}:{{{projects[0]}}}")
+            else:
+                alternatives = " | ".join(
+                    f"@{tag_field}:{{{p}}}" for p in projects
+                )
+                clauses.append(f"({alternatives})")
     if len(clauses) == 1:
         return clauses[0]
     return "(" + " ".join(clauses) + ")"
 
 
-def _candidate_k(top_k: int, project_filter: str | None) -> int:
+def _candidate_k(top_k: int, project_filter: Any) -> int:
     """How many KNN candidates to request per namespace.
 
     Was hardcoded to 20, which starved results in two ways: a caller asking
     for top_k > 20 in one namespace could never get more than 20, and with a
     project filter the top 20 could easily contain zero matches for that
     project even though matches exist further down. Over-fetch when filtering
-    so the Python-side filter still has candidates left after discarding.
+    so the Python-side filter still has candidates left after discarding, and
+    over-fetch further as the project set widens — a domain filter spanning
+    six projects has to share the same candidate budget between them.
     """
     k = max(20, top_k)
-    if project_filter:
-        k = max(k, 50)
+    projects = normalise_project_filter(project_filter)
+    if projects:
+        k = max(k, min(100, 50 + 10 * (len(projects) - 1)))
     return k
+
+
+# Fields FT.SEARCH attaches to every hit regardless of whether the document
+# still exists. Anything else present means there is a real hash behind it.
+_PHANTOM_IGNORED_FIELDS = frozenset({"key", "similarity_score"})
+
+
+def is_phantom(doc: dict[str, Any]) -> bool:
+    """True when a search hit has no backing record (issue #28).
+
+    An index entry whose hash is gone comes back as a document id and a score
+    and nothing else. Deliberately not "content is empty": a project context
+    saved with no description carries content="" and is a perfectly real
+    record whose text lives in current_state, so testing content alone made
+    every such project unrecallable and told the operator to run reindex(),
+    which cannot help. Absence of every field is the honest signal.
+    """
+    return not any(
+        value not in (None, "")
+        for field_name, value in doc.items()
+        if field_name not in _PHANTOM_IGNORED_FIELDS
+    )
+
+
+# Two thresholds, because on all-MiniLM-L6-v2 the honest answer is that
+# relevant and irrelevant raw similarities OVERLAP, so no single cut is both
+# safe and useful. Measured with the shipped ONNX embedder over query/memory
+# pairs written in this repo's own style:
+#
+#   true positives   0.189 ("why do we get a 421 misdirected request" against
+#                    the FastMCP Host/Origin write-up) .. 0.633
+#   false positives  -0.06 .. 0.242 ("search index drift" against the
+#                    responsive-tables note, on shared generic tokens)
+#
+# A cut at 0.4 kept 6 of 8 true positives — it discards a quarter of correct
+# answers, and the user experiences that as "recall forgot something I know
+# is in there", with nothing on screen to say a filter fired. A cut low
+# enough to keep them all (0.15) leaves the worst noise in. So: drop only
+# what is unambiguously noise, and MARK the band in between rather than
+# guess. The marking is what actually addresses issue #30's harm, which was
+# never the row count — it was an agent finding a connection to a WWDC
+# Spotlight note because nothing said not to.
+#
+# Two mechanisms push real matches down and are worth knowing before
+# retuning: the model truncates at 256 tokens while remember() accepts 50k
+# chars un-chunked, so a long write-up embeds as its first 256 tokens; and a
+# short keyword query against long prose scores low by construction.
+_RECALL_MIN_SCORE_DEFAULT = 0.15
+_RECALL_WEAK_SCORE_DEFAULT = 0.35
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        logger.warning("%s is not a number (%r); using %.2f", name, raw, default)
+        return default
+
+
+def recall_min_score() -> float:
+    """Relevance floor for recall results (issue #30). 0 disables it.
+
+    Gates on the RAW similarity, not the adjusted score, and that distinction
+    is the whole design. Raw similarity is the only number here that measures
+    "is this about the same subject". The multipliers stacked on top of it
+    express policy — this is old, this approach was abandoned, this is a
+    derived fact whose verbatim source should outrank it — and policy belongs
+    in the ranking, not in the decision to show a memory at all. Gating on the
+    adjusted score would silently hide the two classes of memory that are
+    deliberately scored down: enriched facts (surface_score 0.5, issue #20)
+    and abandoned experiences (weight 0.1), both of which are exactly what
+    you want back when nothing better matches.
+
+    Deliberately NOT the 0.4 suggested on the issue. The numbers quoted there
+    (1.133, 0.475, 0.384) are adjusted scores — 1.133 is not a reachable
+    cosine — so that cliff was read off a different scale from the one being
+    compared against here, and transferring it cost real results. See the
+    measurements above the constants.
+    """
+    return _float_env("RECALL_MIN_SCORE", _RECALL_MIN_SCORE_DEFAULT)
+
+
+def recall_weak_score() -> float:
+    """Below this a kept result is flagged weak_match. 0 disables the flag.
+
+    The band between the floor and this is where relevant and irrelevant
+    genuinely overlap, and no threshold sorts them. Saying so is more useful
+    than pretending otherwise in either direction: dropping the band loses
+    real answers, returning it silently is what issue #30 was about.
+    """
+    return _float_env("RECALL_WEAK_SCORE", _RECALL_WEAK_SCORE_DEFAULT)
 
 
 def compute_experience_weight(effort_score: int, outcome: str) -> float:
@@ -103,10 +238,22 @@ class RecallResult:
     outcome: str | None = None
     experience_weight: float = 1.0
     result_type: str = "memory"
+    # True when the raw similarity is above the floor but inside the band
+    # where relevant and irrelevant overlap (issue #30). The caller is being
+    # told: this came back, and it may still be nothing.
+    weak_match: bool = False
     breakthrough: str | None = None
     contradictions: list[dict] = field(default_factory=list)
     event_date: float | None = None
     enriched_from: str | None = None
+    # Redistribution rights (v6.6.1) and provenance (v6.6.2). Carried
+    # through untouched: reported, never scored on — landing a field and
+    # changing what recall does with it are deliberately separate releases.
+    # Resolved at read time with the backfill's defaults, so a record a
+    # lagging writer stamped nothing on still reports something honest.
+    licence: str | None = None
+    licence_note: str | None = None
+    provenance: str | None = None
 
 
 class RecallPipeline:
@@ -139,16 +286,37 @@ class RecallPipeline:
         query: str,
         namespaces: list[str] | None = None,
         top_k: int | None = None,
-        project_filter: str | None = None,
+        project_filter: str | list[str] | None = None,
         expand_queries: bool | None = None,
+        min_score: float | None = None,
     ) -> list[RecallResult]:
         """Full recall pipeline: abandoned fast-path, search, score, rank.
+
+        project_filter takes one project name or a list of them; a list is
+        what a domain-scoped recall resolves to (v6.6). Passing an empty list
+        is the same as passing nothing — callers that resolved a filter to
+        nothing must decide for themselves whether an unscoped search is the
+        right answer, because silently running one here would present a global
+        result set as a scoped one.
 
         When expand_queries is True (or RECALL_EXPAND_QUERIES env var is set),
         the query is expanded into N variants via Claude Haiku and results are
         unioned across all variants, deduplicated by key, and ranked by best
         adjusted_score.
+
+        top_k is a ceiling, not a quota: results below RECALL_MIN_SCORE are
+        dropped rather than padding the list out, so an empty or short return
+        is normal and means what it says. See recall_min_score().
+
+        min_score overrides that floor for one call, and 0 switches it off.
+        The floor exists because recall output is spent as an agent's context
+        and a plausible-looking irrelevant result can send it off after a
+        connection that isn't there. Neither cost applies to a human reading
+        a list on screen, so the web UI passes 0 and marks the weak results
+        instead of hiding them.
         """
+        project_filter = normalise_project_filter(project_filter)
+        project_set = set(project_filter)
         if top_k is None:
             top_k = int(os.getenv("MEMORY_RECALL_TOP_K", "5"))
         # Clamp top_k to a sane range
@@ -213,6 +381,17 @@ class RecallPipeline:
 
                 content = doc.get("content", "")
 
+                # Step 4b: Drop phantom hits (issue #28) — an index entry
+                # whose backing hash is gone, which would otherwise be
+                # returned as a result with no text, burning a top_k slot.
+                if is_phantom(doc):
+                    logger.warning(
+                        "Skipping phantom search hit %s in %s — indexed but "
+                        "no backing record. Run reindex() to clear it.",
+                        doc.get("key", "<no key>"), ns,
+                    )
+                    continue
+
                 # Step 5: Filter suppressed topics (using pre-fetched list)
                 if suppressed_topics:
                     content_lower = content.lower()
@@ -221,7 +400,7 @@ class RecallPipeline:
 
                 # Project filter
                 doc_project = doc.get("project") or doc.get("project_name")
-                if project_filter and doc_project != project_filter:
+                if project_set and doc_project not in project_set:
                     continue
 
                 raw_score = max(0.0, 1.0 - float(doc.get("similarity_score", "1.0")))
@@ -312,6 +491,9 @@ class RecallPipeline:
                     contradictions=contradictions,
                     event_date=event_date_val,
                     enriched_from=doc.get("enriched_from"),
+                    licence=effective_licence(doc, ns),
+                    licence_note=doc.get("licence_note"),
+                    provenance=effective_provenance(doc, ns, doc.get("key")),
                 ))
 
         # Step 9b: Query expansion — run additional searches for each variant
@@ -371,10 +553,51 @@ class RecallPipeline:
             if source is not None:
                 if r.adjusted_score > source.adjusted_score:
                     source.adjusted_score = r.adjusted_score
+                    # The raw score has to travel with it. The source is
+                    # standing in for the fact, so the fact's similarity is
+                    # what earned this result its place — and the relevance
+                    # floor below reads `score`. Promoting only the adjusted
+                    # score left the two numbers describing different
+                    # results, and the floor then threw away a source that
+                    # had just been promoted on a match it no longer showed:
+                    # a short fact matching at 1.0 against a long verbatim
+                    # source at 0.39 returned nothing at all.
+                    source.score = max(source.score, r.score)
                 continue  # drop the fact; its source stands in for it
             deduped.append(r)
         results = deduped
         results.sort(key=lambda r: r.adjusted_score, reverse=True)
+
+        # Step 10c: Relevance floor (issue #30). top_k is a ceiling, not a
+        # quota — returning two results when only two are relevant is the
+        # correct answer, and cheaper than three chunks of context an agent
+        # then has to work out are noise.
+        #
+        # Two result types are exempt because neither is here on vector
+        # similarity: an abandoned-approach warning fired on a keyword scan
+        # before the query was even embedded, and a reinstate candidate was
+        # matched on its own hints. Filtering those on a score they didn't
+        # earn their place with would silently disable both features.
+        floor = recall_min_score() if min_score is None else max(0.0, min_score)
+        exempt = lambda r: (  # noqa: E731 - reads better than a def here
+            r.result_type == "abandoned_warning" or r.reinstate_candidate
+        )
+        if floor > 0:
+            kept = [r for r in results if r.score >= floor or exempt(r)]
+            dropped = len(results) - len(kept)
+            if dropped:
+                logger.debug(
+                    "Relevance floor %.3f dropped %d of %d results for %r",
+                    floor, dropped, len(results), query[:60],
+                )
+            results = kept
+
+        # Mark, don't hide, the band where the two distributions overlap.
+        weak_cut = recall_weak_score()
+        if weak_cut > 0:
+            for r in results:
+                if r.score < weak_cut and not exempt(r):
+                    r.weak_match = True
 
         # Step 11: Return top_k
         final = results[:top_k]
@@ -388,7 +611,7 @@ class RecallPipeline:
         self,
         variant: str,
         namespaces: list[str],
-        project_filter: str | None,
+        project_filter: str | list[str] | None,
         suppressed_topics: list[str],
         recency_decay_days: int,
         now: float,
@@ -404,6 +627,7 @@ class RecallPipeline:
         """
         out: list[RecallResult] = []
         query_vector = self.embedder.embed(variant)
+        project_set = set(normalise_project_filter(project_filter))
         per_ns_k = _candidate_k(top_k, project_filter)
         for ns in namespaces:
             raw_results = self.store.search(
@@ -415,12 +639,15 @@ class RecallPipeline:
                 if state_str in (MemoryState.ARCHIVED.value, MemoryState.DELETED.value):
                     continue
                 content = doc.get("content", "")
+                # Phantom guard, parity with the main loop (issue #28).
+                if is_phantom(doc):
+                    continue
                 if suppressed_topics:
                     content_lower = content.lower()
                     if any(topic in content_lower for topic in suppressed_topics):
                         continue
                 doc_project = doc.get("project") or doc.get("project_name")
-                if project_filter and doc_project != project_filter:
+                if project_set and doc_project not in project_set:
                     continue
 
                 raw_score = max(0.0, 1.0 - float(doc.get("similarity_score", "1.0")))
@@ -495,6 +722,9 @@ class RecallPipeline:
                     contradictions=contradictions,
                     event_date=event_date_val,
                     enriched_from=doc.get("enriched_from"),
+                    licence=effective_licence(doc, ns),
+                    licence_note=doc.get("licence_note"),
+                    provenance=effective_provenance(doc, ns, doc.get("key")),
                 ))
         return out
 

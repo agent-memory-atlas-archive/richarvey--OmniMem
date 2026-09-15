@@ -7,22 +7,31 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse
 from starlette.routing import Route
 
+from memory.classification import classification_fields
+from memory.licence import LICENCE_CHOICES, LICENCE_CLASSES
+from memory.provenance import PROVENANCE_CHOICES, PROVENANCE_CLASSES
+
 from .. import deps
 
 PAGE_SIZE = 25
+_LISTABLE_NAMESPACES = ("episodic", "project", "knowledge", "preference")
 
 
 def _get_all_memories(
     namespace: str | None, state: str | None, project: str | None,
-    source: str | None = None,
+    source: str | None = None, licence: str | None = None,
+    provenance: str | None = None,
 ) -> tuple[list[dict], list[str]]:
     """Fetch and filter memories, returning (memories, distinct_projects) in a single pass.
 
-    source splits knowledge by provenance: "rss" keeps only RSS-ingested
+    source splits knowledge by origin: "rss" keeps only RSS-ingested
     articles (they carry a feed_name field), "learned" keeps everything
-    else — extracted facts and remember() writes never have one.
+    else — extracted facts and remember() writes never have one. licence
+    narrows to one redistribution class; "unknown" is the classify queue.
     """
-    ns_list = [namespace] if namespace else ["episodic", "project", "knowledge", "preference"]
+    # Only the four memory namespaces are listable here — skills have their
+    # own pages and carry no classification.
+    ns_list = [namespace] if namespace in _LISTABLE_NAMESPACES else list(_LISTABLE_NAMESPACES)
     memories = []
     projects = set()
 
@@ -35,7 +44,8 @@ def _get_all_memories(
         all_data = deps.store.get_fields_multi(
             keys,
             ("content", "state", "project", "project_name", "updated_at",
-             "created_at", "feed_name", "last_recalled"),
+             "created_at", "feed_name", "last_recalled", "licence", "provenance",
+             "enriched_from", "imported_at", "stack", "goals"),
         )
         for key, data in zip(keys, all_data):
             if data is None:
@@ -55,6 +65,16 @@ def _get_all_memories(
                 continue
             if source == "learned" and data.get("feed_name"):
                 continue
+            # Filter on the value the record has or would be backfilled
+            # with, the same way recall reports it — so ?licence=unknown is
+            # the complete classify queue even before a restart backfills.
+            classification = classification_fields(data, ns, key)
+            mem_licence = classification["licence"]
+            mem_provenance = classification["provenance"]
+            if licence and mem_licence != licence:
+                continue
+            if provenance and mem_provenance != provenance:
+                continue
 
             try:
                 updated_at = float(data.get("updated_at", "0"))
@@ -73,6 +93,8 @@ def _get_all_memories(
                 "state": mem_state,
                 "project": mem_project,
                 "feed_name": data.get("feed_name") or "",
+                "licence": mem_licence,
+                "provenance": mem_provenance,
                 "updated_at": updated_at,
                 "created_at": created_at,
                 "heat": _recall_heat(data.get("last_recalled")),
@@ -102,11 +124,19 @@ def _recall_heat(last_recalled: str | None) -> str:
 async def memories_list(request: Request) -> HTMLResponse:
     """GET /memories — browse with filters and pagination."""
     namespace = request.query_params.get("namespace", "")
+    if namespace not in _LISTABLE_NAMESPACES:
+        namespace = ""
     state = request.query_params.get("state", "")
     project = request.query_params.get("project", "")
     source = request.query_params.get("source", "")
     if source not in ("rss", "learned"):
         source = ""
+    licence = request.query_params.get("licence", "")
+    if licence not in LICENCE_CLASSES:
+        licence = ""
+    provenance = request.query_params.get("provenance", "")
+    if provenance not in PROVENANCE_CLASSES:
+        provenance = ""
     sort = request.query_params.get("sort", "newest")
     page = max(1, int(request.query_params.get("page", "1")))
 
@@ -115,6 +145,8 @@ async def memories_list(request: Request) -> HTMLResponse:
         state=state or None,
         project=project or None,
         source=source or None,
+        licence=licence or None,
+        provenance=provenance or None,
     )
 
     # Articles never change after ingestion, but migrations and backfills can
@@ -155,6 +187,10 @@ async def memories_list(request: Request) -> HTMLResponse:
         params.append(f"&project={project}")
     if source:
         params.append(f"&source={source}")
+    if licence:
+        params.append(f"&licence={licence}")
+    if provenance:
+        params.append(f"&provenance={provenance}")
     if sort != "newest":
         params.append(f"&sort={sort}")
     extra_params = "".join(params)
@@ -185,6 +221,10 @@ async def memories_list(request: Request) -> HTMLResponse:
         state=state,
         project=project,
         source=source,
+        licence=licence,
+        licence_classes=LICENCE_CHOICES,
+        provenance=provenance,
+        provenance_classes=PROVENANCE_CHOICES,
         back_url=back_url,
         sort=sort,
         projects=projects,

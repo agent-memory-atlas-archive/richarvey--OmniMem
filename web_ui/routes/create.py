@@ -11,24 +11,30 @@ from starlette.responses import HTMLResponse, RedirectResponse
 from starlette.routing import Route
 
 from memory.dedup import check_duplicate
+from memory.licence import LICENCE_CHOICES, licence_for_write, validate_licence_note
 from memory.lifecycle import MemoryState
+from memory.provenance import PROVENANCE_CHOICES, provenance_for_write
 
 from .. import deps
 
 logger = logging.getLogger(__name__)
 
+def _render_form(request: Request, values: dict, error=None, duplicate=None) -> HTMLResponse:
+    template = request.app.state.templates.get_template("create.html")
+    return HTMLResponse(template.render(
+        request=request, current_page="create",
+        error=error, duplicate=duplicate, values=values,
+        licence_classes=LICENCE_CHOICES,
+        provenance_classes=PROVENANCE_CHOICES,
+    ))
+
 
 async def create_form(request: Request) -> HTMLResponse:
     """GET /create — memory creation form."""
-    template = request.app.state.templates.get_template("create.html")
-    content = template.render(
-        request=request,
-        current_page="create",
-        error=None,
-        duplicate=None,
-        values={"content": "", "project": "", "namespace": "episodic", "tags": "", "force": False},
-    )
-    return HTMLResponse(content)
+    return _render_form(request, {
+        "content": "", "project": "", "namespace": "episodic", "tags": "",
+        "force": False, "licence": "", "licence_note": "", "provenance": "",
+    })
 
 
 async def create_memory(request: Request) -> HTMLResponse:
@@ -39,6 +45,9 @@ async def create_memory(request: Request) -> HTMLResponse:
     namespace = form.get("namespace", "episodic")
     tags_raw = form.get("tags", "").strip()
     force = form.get("force") == "on"
+    licence_raw = form.get("licence", "").strip()
+    licence_note_raw = form.get("licence_note", "").strip()
+    provenance_raw = form.get("provenance", "").strip()
 
     values = {
         "content": content_text,
@@ -46,18 +55,28 @@ async def create_memory(request: Request) -> HTMLResponse:
         "namespace": namespace,
         "tags": tags_raw,
         "force": force,
+        "licence": licence_raw,
+        "licence_note": licence_note_raw,
+        "provenance": provenance_raw,
     }
 
     # Validate
     if not content_text:
-        template = request.app.state.templates.get_template("create.html")
-        return HTMLResponse(template.render(
-            request=request, current_page="create",
-            error="Content cannot be empty.", duplicate=None, values=values,
-        ))
+        return _render_form(request, values, error="Content cannot be empty.")
 
     if namespace not in {"episodic", "project", "knowledge", "preference"}:
         namespace = "episodic"
+
+    # Licence and provenance: an empty choice takes the namespace default,
+    # through the same helpers as the remember() tool.
+    try:
+        licence_data = licence_for_write(licence_raw, namespace)
+        note = validate_licence_note(licence_note_raw)
+        if note:
+            licence_data["licence_note"] = note
+        provenance_class = provenance_for_write(provenance_raw, namespace)
+    except ValueError as exc:
+        return _render_form(request, values, error=str(exc))
 
     # Parse tags
     tags = [t.strip() for t in tags_raw.split(",") if t.strip()] if tags_raw else []
@@ -69,16 +88,11 @@ async def create_memory(request: Request) -> HTMLResponse:
     if not force:
         dup = check_duplicate(deps.store, namespace, vector, content_text, project_filter=project)
         if dup is not None:
-            template = request.app.state.templates.get_template("create.html")
-            return HTMLResponse(template.render(
-                request=request, current_page="create",
-                error=None, values=values,
-                duplicate={
-                    "key": dup.key,
-                    "content": dup.content[:200],
-                    "similarity": round(dup.similarity, 4),
-                },
-            ))
+            return _render_form(request, values, duplicate={
+                "key": dup.key,
+                "content": dup.content[:200],
+                "similarity": round(dup.similarity, 4),
+            })
 
     # Store
     key = f"mem:{namespace}:{ulid.new().str}"
@@ -91,6 +105,8 @@ async def create_memory(request: Request) -> HTMLResponse:
         "created_at": now,
         "updated_at": now,
         "tags": json.dumps(tags),
+        **licence_data,
+        "provenance": provenance_class,
     }
     if project:
         fields["project"] = project

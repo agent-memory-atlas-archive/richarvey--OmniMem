@@ -118,6 +118,55 @@ if _oauth_provider:
 _start_time = time.time()
 
 
+def _check_index_drift(store) -> None:
+    """Log index drift at startup so it doesn't go unnoticed (issue #28).
+
+    Drift was previously only visible as a field in `health`, which nothing
+    prompts an operator to call — 762 orphaned entries accumulated across
+    four namespaces on a live instance before anyone looked. This reports it
+    once per boot; it does not self-heal, because dropping and recreating
+    every index automatically on startup is a much bigger hammer than the
+    problem, and reindex() is one call away.
+
+    Costs one SCAN of mem:*. Set INDEX_DRIFT_CHECK=false to skip it.
+    """
+    if os.getenv("INDEX_DRIFT_CHECK", "true").strip().lower() in ("false", "0", "no"):
+        return
+    try:
+        report = store.index_report()
+    except Exception as exc:
+        logger.warning("Index drift check failed: %s", exc)
+        return
+
+    drift = report["drift"]
+    if not drift:
+        logger.info("Index drift check: all indexes match their record counts")
+        return
+
+    detail = ", ".join(f"{ns} {delta:+d}" for ns, delta in sorted(drift.items()))
+    orphans = {ns: d for ns, d in drift.items() if d > 0}
+    if orphans:
+        logger.warning(
+            "Index drift on %d namespace(s): %s. The positive counts are "
+            "index entries with no backing record (%d in total); call "
+            "reindex() to clear them — data-safe, rebuilds the index only.",
+            len(drift), detail, sum(orphans.values()),
+        )
+        return
+
+    # Negative only: the index is behind the records rather than ahead. At
+    # startup that is usually a recreated index still catching up —
+    # store.connect() runs _migrate_indexes() moments earlier, and
+    # reindex_namespace already documents that FT.INFO num_docs takes a moment
+    # to settle after a recreate. Worth saying, not worth alarming about, and
+    # reindex() is not the remedy for it.
+    logger.info(
+        "Index counts are behind the record counts (%s) — expected shortly "
+        "after an index rebuild; re-check with health() once settled.",
+        detail,
+    )
+
+
 def _init() -> None:
     """Initialise shared dependencies: Valkey store, embedder, lifecycle, pipeline."""
     from memory.embedder import Embedder
@@ -146,9 +195,17 @@ def _init() -> None:
 
     # One-time migrations: set project_name on ULID-keyed project memories,
     # backfill state on pre-state-field memories (needed by the recall
-    # filter push-down), and label pre-existing RSS articles with a project.
+    # filter push-down), label pre-existing RSS articles with a project,
+    # seed work-type domains from each project's stack field so the v6.6
+    # domain filter isn't empty on the first run after an upgrade, and
+    # backfill the v6.6.1 licence field with honest defaults (own for
+    # conversation namespaces, unknown for articles) and the v6.6.2
+    # provenance class (retrieved / concluded / asserted).
     from memory.migrations import (
+        migrate_licence,
+        migrate_provenance,
         migrate_missing_state,
+        migrate_project_domains,
         migrate_project_names,
         migrate_rss_article_projects,
     )
@@ -156,6 +213,11 @@ def _init() -> None:
     migrate_project_names(store)
     migrate_missing_state(store)
     migrate_rss_article_projects(store)
+    migrate_project_domains(store)
+    migrate_licence(store)
+    migrate_provenance(store)
+
+    _check_index_drift(store)
 
     # Start background enrichment worker for async fact extraction
     from memory.enrichment import EnrichmentWorker
@@ -177,8 +239,8 @@ def _register_tools() -> None:
     )
     from tools.project import (
         set_project_context, get_project_context, list_projects,
-        update_project_state, compile_project_context, delete_project,
-        deprioritise_project, reinstate_project,
+        update_project_state, compile_project_context, compile_project_domains,
+        delete_project, deprioritise_project, reinstate_project,
     )
     from tools.audit import memory_audit, why_did_you_mention, explain_memory, reindex
     from tools.experience import (
@@ -189,6 +251,8 @@ def _register_tools() -> None:
     from tools.contradiction import check_contradictions
     from tools.briefing import briefing
     from tools.knowledge import recent_knowledge, promote_knowledge
+    from tools.licence import set_licence
+    from tools.provenance import set_provenance
     from tools.queue import queue_status
     from tools.skills import compile_skill, find_skills, get_skill, bless
 
@@ -215,6 +279,7 @@ def _register_tools() -> None:
     mcp.tool()(list_projects)
     mcp.tool()(update_project_state)
     mcp.tool()(compile_project_context)
+    mcp.tool()(compile_project_domains)
     mcp.tool()(delete_project)
     mcp.tool()(deprioritise_project)
     mcp.tool()(reinstate_project)
@@ -247,6 +312,8 @@ def _register_tools() -> None:
     # Knowledge tools
     mcp.tool()(recent_knowledge)
     mcp.tool()(promote_knowledge)
+    mcp.tool()(set_licence)
+    mcp.tool()(set_provenance)
 
     # Queue tools
     mcp.tool()(queue_status)
@@ -279,30 +346,14 @@ def health() -> dict:
             store.client.ping()
             result["valkey_connected"] = True
 
-            # One SCAN of mem:* for all four namespaces instead of one full
-            # keyspace SCAN per namespace.
-            try:
-                actual_counts = store.count_all_records()
-            except Exception:
-                actual_counts = {}
+            # One SCAN of mem:* for every namespace instead of one full
+            # keyspace SCAN per namespace. Shared with briefing() and the
+            # startup check so all three agree on what drift is.
+            from memory.store import drift_note
 
-            for namespace in ("episodic", "project", "knowledge", "preference", "skill"):
-                idx_name = f"idx:{namespace}"
-                num_docs: int | str
-                try:
-                    info = store.client.ft(idx_name).info()
-                    num_docs = int(info.get("num_docs", 0))
-                except Exception:
-                    num_docs = "unavailable"
-                result["indexes"][idx_name] = num_docs
-
-                if namespace in actual_counts:
-                    actual = actual_counts[namespace]
-                    result["records"][namespace] = actual
-                    if isinstance(num_docs, int) and num_docs != actual:
-                        result["drift"][namespace] = num_docs - actual
-                else:
-                    result["records"][namespace] = "unavailable"
+            result.update(store.index_report())
+            if result["drift"]:
+                result["drift_note"] = drift_note(result["drift"])
     except Exception:
         result["valkey_error"] = "connection_failed"
 

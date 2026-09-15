@@ -25,6 +25,9 @@ _VALID_KEY_PREFIXES = (
 # Valid namespace names for search index lookups
 _VALID_NAMESPACES = {"episodic", "project", "knowledge", "preference", "skill"}
 
+# Same namespaces, in a fixed order for anything that reports on all of them.
+INDEX_ORDER = ("episodic", "project", "knowledge", "preference", "skill")
+
 VECTOR_DIM = 384
 VECTOR_ALGORITHM = "HNSW"
 DISTANCE_METRIC = "COSINE"
@@ -41,23 +44,25 @@ _NAMESPACE_RETURN_FIELDS: dict[str, tuple[str, ...]] = {
         "reinstate_hints", "effort_score", "outcome", "iterations",
         "abandoned_approaches", "breakthrough", "gotchas", "experience_weight",
         "contradictions", "recall_count", "last_recalled", "event_date",
-        "enriched_from",
+        "enriched_from", "licence", "licence_note", "provenance",
     ),
     "project": (
         "similarity_score", "content", "project_name", "stack", "state",
         "surface_score", "created_at", "updated_at", "recall_count", "last_recalled",
+        "domains", "licence", "licence_note", "provenance",
     ),
     "knowledge": (
         "similarity_score", "content", "source_url", "feed_name", "published_at",
         "topics", "state", "surface_score", "created_at", "updated_at",
         "recall_count", "last_recalled", "expires_at",
         "project", "event_date", "tags", "enriched_from",
+        "licence", "licence_note", "provenance",
     ),
     "preference": (
         "similarity_score", "content", "project", "scope", "state",
         "surface_score", "created_at", "updated_at", "tags",
         "recall_count", "last_recalled", "source_doc_id",
-        "event_date", "enriched_from",
+        "event_date", "enriched_from", "licence", "licence_note", "provenance",
     ),
     # Skills are whole-document objects: search returns discovery metadata
     # only, never the body. The canonical body is fetched intact by ID via
@@ -91,6 +96,13 @@ INDEX_DEFINITIONS: dict[str, dict[str, Any]] = {
             NumericField("iterations"),
             NumericField("experience_weight"),
             NumericField("recall_count"),
+            # Redistribution rights (v6.6.1) and provenance class (v6.6.2):
+            # one bare class per record, so the TAG tokeniser sees exactly
+            # one value. Indexed on every writable namespace so "everything
+            # still unclassified" and a future export filter are a tag
+            # clause, not a full scan.
+            TagField("licence"),
+            TagField("provenance"),
         ],
     },
     "idx:project": {
@@ -108,6 +120,14 @@ INDEX_DEFINITIONS: dict[str, dict[str, Any]] = {
             NumericField("created_at"),
             NumericField("updated_at"),
             NumericField("recall_count"),
+            # Work-type domains (v6.6), sharing the compiled-skill vocabulary.
+            # Stored comma-separated, which is what a TAG field actually
+            # tokenises on — the JSON-array form used by `tags`/`topics`
+            # indexes as unusable tokens. Startup index migration picks the
+            # new field up automatically.
+            TagField("domains"),
+            TagField("licence"),
+            TagField("provenance"),
         ],
     },
     "idx:knowledge": {
@@ -131,6 +151,8 @@ INDEX_DEFINITIONS: dict[str, dict[str, Any]] = {
             # indexed so the recall project filter can be pushed down.
             # Startup index migration picks up the new field automatically.
             TagField("project"),
+            TagField("licence"),
+            TagField("provenance"),
         ],
     },
     "idx:preference": {
@@ -149,6 +171,8 @@ INDEX_DEFINITIONS: dict[str, dict[str, Any]] = {
             NumericField("created_at"),
             NumericField("updated_at"),
             NumericField("recall_count"),
+            TagField("licence"),
+            TagField("provenance"),
         ],
     },
     # Compiled skills (v6). The vector embeds discovery metadata (name +
@@ -175,6 +199,31 @@ INDEX_DEFINITIONS: dict[str, dict[str, Any]] = {
         ],
     },
 }
+
+
+def drift_note(drift: dict[str, int]) -> str:
+    """Plain-English reading of an index_report drift map.
+
+    Positive and negative drift are different faults with different remedies,
+    so one sentence cannot describe both: reindex() clears orphaned entries
+    and does nothing for an index that is merely behind.
+    """
+    orphans = sum(d for d in drift.values() if d > 0)
+    missing = -sum(d for d in drift.values() if d < 0)
+    parts: list[str] = []
+    if orphans:
+        parts.append(
+            f"{orphans} index entr{'y' if orphans == 1 else 'ies'} with no "
+            "backing record. Clear with reindex(); it is data-safe and only "
+            "rebuilds the index."
+        )
+    if missing:
+        parts.append(
+            f"{missing} record{'' if missing == 1 else 's'} the index has not "
+            "picked up — usually an index still settling after a rebuild, "
+            "which reindex() does not fix. Re-check with health()."
+        )
+    return " ".join(parts)
 
 
 class ValkeyStore:
@@ -242,23 +291,44 @@ class ValkeyStore:
     def _migrate_indexes(self) -> None:
         """Drop indexes whose field count doesn't match the definition.
 
-        This is data-safe — dropindex() only removes the index, not the
-        underlying hashes. _ensure_indexes() then recreates it with the
-        new fields, and RediSearch re-indexes existing hashes automatically.
+        This is data-safe — dropping an index removes only the index, not the
+        underlying hashes. _ensure_indexes() then recreates it with the new
+        fields, and the search module re-indexes existing hashes automatically.
+
+        GOTCHA (fixed in 6.6.0, silently broken before it): do NOT use
+        valkey-py's `client.ft(name).dropindex()` here. It appends its
+        delete-documents flag as a positional argument even when False, so the
+        wire command is `FT.DROPINDEX <index> ""` — three arguments. RediSearch
+        tolerates the trailing empty string; valkey-search rejects it with
+        "wrong number of arguments". That ResponseError used to be caught by
+        the same `except` that handles a missing index, so every migration
+        failed silently and every upgraded instance kept a stale index while
+        the logs said nothing. The drop now has its own error handling, and a
+        failure is logged as an error rather than swallowed.
         """
         for idx_name, idx_def in INDEX_DEFINITIONS.items():
             try:
                 info = self.client.ft(idx_name).info()
-                existing_count = len(info.get("attributes", []))
-                expected_count = len(idx_def["fields"])
-                if existing_count < expected_count:
-                    logger.info(
-                        "Index %s has %d fields, expected %d — dropping for recreation",
-                        idx_name, existing_count, expected_count,
-                    )
-                    self.client.ft(idx_name).dropindex()
             except valkey.ResponseError:
-                pass  # Index doesn't exist yet — _ensure_indexes will create it
+                continue  # Index doesn't exist yet — _ensure_indexes creates it
+
+            existing_count = len(info.get("attributes", []))
+            expected_count = len(idx_def["fields"])
+            if existing_count >= expected_count:
+                continue
+
+            logger.info(
+                "Index %s has %d fields, expected %d — dropping for recreation",
+                idx_name, existing_count, expected_count,
+            )
+            try:
+                self.client.execute_command("FT.DROPINDEX", idx_name)
+            except valkey.ResponseError as exc:
+                logger.error(
+                    "Could not drop index %s for migration (%s) — it will keep "
+                    "its old fields and any new ones will not be searchable",
+                    idx_name, exc,
+                )
 
     def _ensure_indexes(self) -> None:
         """Create vector indexes if they don't already exist."""
@@ -571,10 +641,13 @@ class ValkeyStore:
         except valkey.ResponseError:
             pass
 
-        # Use execute_command directly — the client wrapper's .dropindex()
-        # was returning a response the python client misinterpreted, leaving
-        # the index in place and causing create_index to fail with "already
-        # exists". The raw command works reliably.
+        # Use execute_command directly. The symptom recorded here originally
+        # was that .dropindex() left the index in place and create_index then
+        # failed with "already exists"; the cause (pinned down in 6.6.0) is
+        # that valkey-py appends its delete-documents flag positionally even
+        # when False, so the command is `FT.DROPINDEX <index> ""` and
+        # valkey-search rejects the third argument outright. See
+        # _migrate_indexes, which had the same bug without the workaround.
         try:
             self.client.execute_command("FT.DROPINDEX", idx_name)
         except valkey.ResponseError as exc:
@@ -615,6 +688,46 @@ class ValkeyStore:
             "actual_records": actual,
             "removed_phantoms": max(0, before - actual),
         }
+
+    def index_report(self) -> dict[str, dict[str, Any]]:
+        """Index num_docs vs actual record count, per namespace.
+
+        The single place that comparison is made: health() reports it,
+        briefing() surfaces it, and startup logs it, so the three can't
+        disagree about what drift is (issue #28).
+
+        A positive drift is index entries with no backing record — deletes
+        the search module didn't observe. Those are what reindex() clears.
+        Negative drift is the rarer opposite (records the index hasn't picked
+        up yet) and is reported the same way rather than hidden.
+        """
+        indexes: dict[str, int | str] = {}
+        records: dict[str, int | str] = {}
+        drift: dict[str, int] = {}
+
+        try:
+            actual_counts = self.count_all_records()
+        except Exception:
+            actual_counts = {}
+
+        for namespace in INDEX_ORDER:
+            idx_name = f"idx:{namespace}"
+            try:
+                info = self.client.ft(idx_name).info()
+                num_docs: int | str = int(info.get("num_docs", 0))
+            except Exception:
+                num_docs = "unavailable"
+            indexes[idx_name] = num_docs
+
+            if namespace in actual_counts:
+                actual = actual_counts[namespace]
+                records[namespace] = actual
+                if isinstance(num_docs, int) and num_docs != actual:
+                    drift[namespace] = num_docs - actual
+            else:
+                records[namespace] = "unavailable"
+
+        return {"indexes": indexes, "records": records, "drift": drift}
 
     def scan_prefix(self, prefix: str) -> list[str]:
         """Return all keys matching a prefix using SCAN."""

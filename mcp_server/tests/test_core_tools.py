@@ -140,7 +140,10 @@ class TestRecall:
 
 
 class TestRecallIndex:
-    def test_returns_snippets_not_full_content(self):
+    def test_returns_snippets_not_full_content(self, no_relevance_floor):
+        # "A"*50 against "A"*500 is two distinct tokens with no overlap:
+        # near-zero in the fake, and only 0.265 on the real model. The
+        # subject here is snippet shape, not whether the pair matches.
         long_content = "A" * 500
         remember(long_content)
         result = recall_index("A" * 50)

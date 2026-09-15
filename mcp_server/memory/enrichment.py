@@ -22,6 +22,8 @@ import ulid
 
 from .dedup import check_duplicate
 from .extraction import extract_facts, ExtractedFact
+from .licence import LICENCE_OWN
+from .provenance import PROVENANCE_CONCLUDED
 from .lifecycle import MemoryState
 
 if TYPE_CHECKING:
@@ -104,18 +106,30 @@ class EnrichmentWorker:
         source_event_date = payload.get("event_date")
         source_created_at = payload.get("created_at")
 
+        # A fact is a derivative of its source, so it carries exactly the
+        # source's redistribution rights and provenance — never the
+        # namespace defaults it lands in. The live record wins (a
+        # reclassification between enqueue and now must be inherited); the
+        # payload, written by the call that queued the job, fills in for a
+        # source that is gone or was never stamped.
+        source_licence: dict[str, str] = {}
+        declared = payload.get("classification")
+
         if batch_mode and batch_content:
-            # Batch extraction: all chunks combined into one API call.
-            # If the payload predates the created_at field (queued before an
-            # upgrade), fall back to reading the first chunk's timestamps so
-            # the facts still get a temporal anchor.
-            if not source_created_at and key:
+            # Batch extraction: all chunks combined into one API call. The
+            # first chunk stands in for the document: its licence (every
+            # chunk carries the same one), and — if the payload predates the
+            # created_at field (queued before an upgrade) — its timestamps,
+            # so the facts still get a temporal anchor.
+            if key:
                 rows = self._store.get_fields_multi(
-                    [key], ("event_date", "created_at")
+                    [key], ("event_date", "created_at", "licence", "licence_note", "provenance")
                 )
                 src = rows[0] if rows and rows[0] else {}
-                source_event_date = source_event_date or src.get("event_date")
-                source_created_at = src.get("created_at")
+                source_licence = _licence_of({**(declared or {}), **src})
+                if not source_created_at:
+                    source_event_date = source_event_date or src.get("event_date")
+                    source_created_at = src.get("created_at")
             facts = extract_facts(batch_content)
         else:
             # Single-key extraction: read content from store
@@ -128,6 +142,7 @@ class EnrichmentWorker:
                 return
             source_event_date = data.get("event_date") or source_event_date
             source_created_at = data.get("created_at") or source_created_at
+            source_licence = _licence_of({**(declared or {}), **data})
             facts = extract_facts(content)
 
         if not facts:
@@ -173,6 +188,7 @@ class EnrichmentWorker:
                 "tags": json.dumps(tags or []),
                 "source_doc_id": source_doc_id,
                 "enriched_from": key,
+                **source_licence,
             }
             if project:
                 fields["project"] = project
@@ -200,6 +216,26 @@ class EnrichmentWorker:
         )
 
 
+def _licence_of(source: dict) -> dict[str, str]:
+    """Classification a derived fact inherits from its source memory.
+
+    A fact is a restatement: it carries the source's redistribution
+    rights and the source's provenance (an extracted fact of something the
+    human asserted is still asserted — extraction is not reasoning). A
+    source stamped with neither is a conversation write from before the
+    fields existed (knowledge is never enriched), so it yields own and
+    concluded — the same answer the backfill and the read-time fallbacks
+    give it.
+    """
+    inherited = {
+        "licence": source.get("licence") or LICENCE_OWN,
+        "provenance": source.get("provenance") or PROVENANCE_CONCLUDED,
+    }
+    if source.get("licence_note"):
+        inherited["licence_note"] = source["licence_note"]
+    return inherited
+
+
 def enqueue(
     store: "ValkeyStore",
     key: str,
@@ -208,8 +244,14 @@ def enqueue(
     tags: list[str] | None = None,
     doc_id: str | None = None,
     created_at: str | None = None,
+    classification: dict[str, str] | None = None,
 ) -> None:
-    """Push a memory key onto the enrichment queue for background processing."""
+    """Push a memory key onto the enrichment queue for background processing.
+
+    ``classification`` is the licence/provenance the write stamped on the
+    source, so the facts inherit it even if the source is gone by the time
+    the job runs.
+    """
     payload = json.dumps({
         "key": key,
         "namespace": namespace,
@@ -217,6 +259,7 @@ def enqueue(
         "tags": tags,
         "doc_id": doc_id,
         "created_at": created_at,
+        "classification": classification,
     })
     store.client.lpush(QUEUE_KEY, payload)
 
@@ -230,6 +273,7 @@ def enqueue_batch(
     tags: list[str] | None = None,
     doc_id: str | None = None,
     created_at: str | None = None,
+    classification: dict[str, str] | None = None,
 ) -> None:
     """Push a batch enrichment job — all chunks extracted in one Haiku call."""
     payload = json.dumps({
@@ -239,6 +283,7 @@ def enqueue_batch(
         "tags": tags,
         "doc_id": doc_id,
         "created_at": created_at,
+        "classification": classification,
         "batch_mode": True,
         "batch_content": combined_content[:24000],  # cap for prompt size
     })

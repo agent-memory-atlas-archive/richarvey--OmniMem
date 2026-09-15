@@ -66,6 +66,8 @@ Not just a key-value store with an MCP wrapper. OmniMem models how memory actual
 - **[One-call briefing](docs/features.md#session-briefing)** — a single `briefing()` returns project context, experience stats, stale memories, new articles, contradiction warnings, and skill suggestions. No three-step warm-up.
 - **[The skill compiler](docs/skill-compiler.md)** — distils reinforced lessons and dead ends into loadable skills, behind a propose-and-accept gate so bad lessons cannot become policy silently.
 - **[Auto-maintenance](docs/features.md#automatic-maintenance)** — duplicates archived, contradictions flagged, expired knowledge cleaned up, all in the background.
+- **[Redistribution rights](docs/rss-knowledge.md#licence-and-redistribution-rights)** — every memory records whether it may be redistributed (`own`, `open`, `restricted`, `unknown`), decided at ingest from what the feed declares. Recall points out what nobody has classified so you can say while the content is in front of you.
+- **[Provenance](docs/memory-types.md#common-fields)** — every memory says whether the human asserted it, the system concluded it, or it was retrieved from elsewhere, so a later session can tell evidence from inference instead of citing its own reasoning as corroboration.
 - **[Web UI](docs/web-ui.md)** — browse, search, and manage everything from an htmx dashboard, with telemetry and a Prometheus `/metrics` endpoint.
 
 The ranking formula behind every recall:
@@ -86,7 +88,7 @@ One memory layer for all of them: [claude.ai](guides/claude-ai.md), [Claude Code
 
 ## Architecture
 
-Four containers. Nothing leaves your machine. Local embeddings via sentence-transformers, storage in Valkey with vector search, and both front doors share the same memory engine.
+Four containers. Nothing leaves your machine. Local embeddings via ONNX Runtime (no PyTorch), storage in Valkey with vector search, and both front doors share the same memory engine.
 
 ```mermaid
 flowchart TB
@@ -118,7 +120,7 @@ No SaaS. No vendor lock-in. No context shipped to someone else's servers.
 
 - **Valkey** is an open source Redis fork. All your data stays in a named Docker volume on your own machine.
 - **Multi-arch Docker images** for amd64 and arm64. It runs on a Raspberry Pi, AWS Graviton, or Apple Silicon just as well as x86.
-- **sentence-transformers** runs embeddings locally with no API calls.
+- **ONNX Runtime** runs the all-MiniLM-L6-v2 embeddings locally with no API calls and no PyTorch — the MCP image went from 2.0 GB to 634 MB in 6.7.
 - **MIT licensed** means fork it, extend it, run it wherever you want.
 - **One backup command** calls `dump_to_file()` and exports everything to a JSON file you own.
 

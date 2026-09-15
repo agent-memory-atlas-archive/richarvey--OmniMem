@@ -6,9 +6,10 @@ Every tool the OmniMem MCP server exposes, grouped by area. The server delivers 
 
 | Tool | What it does |
 |---|---|
-| `remember(content, project?, tags?, force?, mode?)` | Store a memory. In `full` mode (default) extracts atomic facts via Claude Haiku and routes preferences to the preference namespace; `raw` stores verbatim. Auto-checks for duplicates and contradictions |
-| `remember_document(content, chunk_strategy, project?, tags?, namespace?, chunk_size?, mode?)` | Index a long-form document by splitting it into chunks (`turn_pairs`, `sentences`, `paragraphs`, or `fixed_tokens`) and storing each as a memory linked by a shared `doc_id` |
-| `recall(query, top_k?, project_filter?, expand_queries?)` | Semantic search across all namespaces. With `expand_queries=true`, generates alternative phrasings via Claude Haiku and unions the results to improve recall coverage when query vocabulary doesn't match stored content |
+| `remember(content, project?, tags?, force?, mode?, licence?, provenance?)` | Store a memory. In `full` mode (default) extracts atomic facts via Claude Haiku and routes preferences to the preference namespace; `raw` stores verbatim. Auto-checks for duplicates and contradictions. `licence` records redistribution rights (`own`, `open`, `restricted`, `unknown`, or an identifier such as `cc-by-4.0`); defaults to `own` for episodic/project/preference and `unknown` for knowledge. `provenance` records where it came from (`asserted` by the human, `concluded` by the system, `retrieved` from an external source); defaults to `concluded` for episodic and project memories, `asserted` for preferences, `retrieved` for knowledge |
+| `remember_document(content, chunk_strategy, project?, tags?, namespace?, chunk_size?, mode?, licence?, provenance?)` | Index a long-form document by splitting it into chunks (`turn_pairs`, `sentences`, `paragraphs`, or `fixed_tokens`) and storing each as a memory linked by a shared `doc_id`. `licence` and `provenance` apply to every chunk — say where the document came from |
+| `recall(query, top_k?, project_filter?, expand_queries?, domain_filter?)` | Semantic search across all namespaces. `domain_filter` searches every project declaring a work-type domain at once (`domain_filter="python"`), intersecting with `project_filter` when both are given. With `expand_queries=true`, generates alternative phrasings via Claude Haiku and unions the results to improve recall coverage when query vocabulary doesn't match stored content. Every classified result carries its `licence` and `provenance`; when any result's licence is still `unknown`, a trailing `licence_notice` lists the keys so the human can classify them. Neither field affects ranking |
+| `recall_index(query, top_k?, project_filter?, snippet_length?, domain_filter?)` | Lightweight recall returning ranked snippets and a token estimate; expand chosen keys with `recall_detail()`. Reports the resolved domain filter under `domain_filter` and unclassified results under `licence_notice` |
 | `deprioritise(key_or_query, reason, reinstate_hints?)` | Soft-suppress without deleting |
 | `archive(key_or_query)` | Remove from recall but keep for history |
 | `reinstate(key_or_query)` | Bring a deprioritised memory back |
@@ -25,11 +26,12 @@ Every tool the OmniMem MCP server exposes, grouped by area. The server delivers 
 
 | Tool | What it does |
 |---|---|
-| `set_project_context(name, description, stack, goals, current_state)` | Create or update project memory |
+| `set_project_context(name, description, stack, goals, current_state, notes?, domains?)` | Create or update project memory. `domains` declares the kinds of work in the project (`["python", "docker"]`) using the compiled-skill vocabulary; omit it to leave existing domains alone, pass `[]` to clear them |
 | `get_project_context(name)` | Retrieve it, called at every session start |
 | `update_project_state(name, current_state, notes?)` | Update state without re-embedding |
-| `compile_project_context(name, auto_save?)` | Auto-produce or refresh a project context from its episodic memories, tags, experience data, and abandoned approaches |
-| `list_projects()` | See all stored projects |
+| `compile_project_context(name, auto_save?)` | Auto-produce or refresh a project context from its episodic memories, tags, experience data, and abandoned approaches. The draft includes suggested domains |
+| `compile_project_domains(name, auto_save?)` | Suggest work-type domains for a project from its stack field and its own recurring memory tags, with the evidence behind each one. Proposes by default; `auto_save=True` writes the merged list. Never removes a domain |
+| `list_projects(domain?)` | See all stored projects and their domains; `domain="python"` narrows to the projects declaring it |
 | `delete_project(name, confirm?, include_context?)` | Bulk delete every memory belonging to a project by direct key scan (no semantic search, so nothing gets missed). Preview by default; `confirm=True` deletes in pipelined batches; `include_context=True` also removes the project context entry |
 
 ## Experience scoring
@@ -57,7 +59,9 @@ See [skill-compiler.md](skill-compiler.md) for how compilation and the propose-a
 
 | Tool | What it does |
 |---|---|
-| `recent_knowledge(days?, feed_name?, topics?, limit?)` | Query recent RSS articles with optional filters, sorted newest first |
+| `recent_knowledge(days?, feed_name?, topics?, limit?, licence?)` | Query recent RSS articles with optional filters, sorted newest first. `licence="unknown"` lists what still needs classifying |
+| `set_provenance(provenance, keys)` | Reclassify where memories came from: `asserted`, `concluded`, or `retrieved`. Facts extracted from a reclassified memory follow it; `updated_at` is untouched. Most often used to mark a memory the human vouches for as `asserted` after the upgrade backfill defaulted episodic memories to `concluded` |
+| `set_licence(licence, keys?, feed_name?, note?)` | Record redistribution rights on stored memories: specific `keys`, or every article from one RSS `feed_name`. Accepts a class (`own`, `open`, `restricted`, `unknown`) or a recognised identifier (`ogl-3.0`, `cc-by-4.0`, `all-rights-reserved`), which is kept as the note. Facts extracted from a classified memory follow it. Reclassifying clears any stale note, and never bumps `updated_at`. Only affects existing records — set `licence:` on the feed itself so future articles arrive classified |
 | `promote_knowledge(key, domain?, demote?, rules?)` | Mark an article as permanently useful by clearing its expiry. With `domain`, also mark it skill-eligible: the next `compile_skill()` for that domain renders it in the skill's Reference section. Pass `rules=[{kind, text}, ...]` to extract an article's discrete guidance into individual stance-prefixed Reference rules (reviewed at promotion, so compiles stay deterministic). `demote=True` removes a domain again |
 
 ## Audit and backup
@@ -65,7 +69,7 @@ See [skill-compiler.md](skill-compiler.md) for how compilation and the propose-a
 | Tool | What it does |
 |---|---|
 | `memory_audit(project?, namespace?, limit?, offset?)` | All memories by state; full state-count summary plus a paginated `entries` list (default 100, max 500) |
-| `explain_memory(key)` | Full history for a single memory |
+| `explain_memory(key)` | Full history for a single memory. Includes `licence`, `licence_note` and `provenance` resolved the way recall reports them |
 | `why_did_you_mention(query)` | Debug why something surfaced |
 | `dump_to_file(filename?)` | Export everything to a timestamped JSON file |
 | `restore_from_file(filename, dry_run?)` | Restore from backup, merges rather than overwrites, re-embeds for immediate recall |

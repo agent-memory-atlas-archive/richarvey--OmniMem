@@ -28,9 +28,11 @@ At the beginning of every session:
      description="<ask the human for a brief description>",
      stack=["<technologies>"],
      goals=["<current goals>"],
-     current_state="<starting point>"
+     current_state="<starting point>",
+     domains=["<kinds of work, e.g. python, docker, design>"]
    )
    ```
+1. If the project context has no `domains`, call `compile_project_domains("<project_name>")` — it proposes them from the stack and the project's own recurring tags, with the evidence for each. Show the human the draft and only save with `auto_save=True` if they agree. Domains are what let a later session search across projects rather than inside one.
 1. Briefly summarise what you found:
 - Current project state and goals
 - Recent decisions and discovered patterns
@@ -51,6 +53,8 @@ At the beginning of every session:
 
 - Call `recall("<problem description>")` — you may find a prior solution, a relevant pattern, or a knowledge article that gives you a head start
 - If a recalled knowledge article seems relevant, mention it: *“I found an article from [source] about X — shall I use that as a research base?”*
+- **When the problem is about a kind of work rather than this project** — a Python gotcha, a CSS layout trap, a Docker build failure — add `domain_filter`: `recall("<problem>", domain_filter="python")` searches every project doing that kind of work. Compiled skills hold the lessons that already cleared the reinforcement gate; the domain filter reaches the raw memories underneath, including the ones that never became a rule. If the reply starts with a `domain_filter_notice` saying the filter was not applied, no project declares that domain and the results you are reading span everything — say so rather than presenting them as a targeted search
+- **If the reply ends with a `licence_notice`**, some results have no recorded redistribution licence — usually RSS articles from a feed that never declared one. When the human can say whether the source may be redistributed (an OGL or CC BY page is open; a paywalled or all-rights-reserved one is restricted), record it: `set_licence(keys=[...], licence="open")`, or `set_licence(feed_name="<feed>", licence="ogl-3.0")` to classify everything from one feed. Do not guess on their behalf — an unknown is honest, a wrong `open` is a liability
 
 **Before suggesting OR agreeing to any library, tool, or architectural approach** — including ones the human proposes:
 
@@ -71,6 +75,10 @@ At the beginning of every session:
 - `episodic` — things that happened: decisions made, work done, bugs fixed (default)
 - `knowledge` — facts, rules, preferences, reference information
 - `project` — scoped context for a specific project
+
+**Say where content came from.** Every memory carries a `licence` — its redistribution rights. `remember()` defaults to `own` (a decision, a fix, a preference written here) and `knowledge` writes to `unknown`, so pass `licence=` whenever the content is someone else's: `licence="restricted"` for a summary of a paywalled document or vendor page, `licence="open"` (or the identifier, `"cc-by-4.0"`, `"ogl-3.0"`) for a redistributable source. `remember_document()` is the write most likely to be third-party material, so always say. This field is about redistribution *rights* only; it says nothing about who may see the memory.
+
+**Say who is speaking.** Every memory also carries a `provenance`: `asserted` (the human stated it), `concluded` (your own reasoning or write-up), or `retrieved` (an external source). `remember()` defaults to `concluded` for episodic and project memories, `asserted` for preferences, `retrieved` for knowledge (project *context* set with `set_project_context()` is `asserted`). Pass `provenance="asserted"` when the human dictated the content, and `"retrieved"` when you are storing what a document or page said — a later session must be able to tell your conclusions from evidence, or your own inferences get recalled as independent corroboration for the reasoning that produced them. Recall reports `provenance` on every result; when a `concluded` memory is the only support for a claim, say so rather than presenting it as established. Reclassify with `set_provenance(keys=[...], provenance="asserted")` when the human vouches for something.
 
 Use this tagging vocabulary for consistency:
 

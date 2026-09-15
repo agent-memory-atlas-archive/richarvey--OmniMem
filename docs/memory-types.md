@@ -21,7 +21,7 @@ Every memory is a single Valkey hash. All field values are strings (Valkey hashe
 - **Lists and objects** are JSON-encoded strings, e.g. `tags` is `'["docker", "arm64"]'`.
 - **Booleans** are `"1"`/absent (`blessed`) or `"true"`/absent (`generated`).
 
-The one exception is `vector`: a binary blob of 384 float32 values (1,536 bytes), the sentence-transformers all-MiniLM-L6-v2 embedding of the memory's content. It is written by `store.upsert()` and read only through the binary-safe client (`store.get_vectors_multi()`); the regular text-mode client never touches it.
+The one exception is `vector`: a binary blob of 384 float32 values (1,536 bytes), the all-MiniLM-L6-v2 embedding of the memory's content (computed by ONNX Runtime since 6.7; identical to the sentence-transformers output). It is written by `store.upsert()` and read only through the binary-safe client (`store.get_vectors_multi()`); the regular text-mode client never touches it.
 
 ## Keys
 
@@ -46,6 +46,9 @@ These appear on every namespace unless noted:
 | `vector` | 1,536-byte float32 blob | Embedding. What gets embedded varies by type (see each spec). |
 | `recall_count` | stringified int | Incremented (HINCRBY) each time recall returns the memory. Feeds `/telemetry` and `/metrics`. |
 | `last_recalled` | unix seconds string | Set alongside `recall_count`. |
+| `licence` | `own` \| `open` \| `restricted` \| `unknown` | Redistribution rights (v6.6.1), set at write time and never derived from ranking. `own` for conversation-sourced writes, what the feed declares for RSS articles (`unknown` if it declares nothing), inherited from the source for extracted facts. Indexed as a tag on every writable namespace. Backfilled on upgrade: conversation namespaces `own`, articles and untraceable knowledge `unknown`. Skills carry none — a compiled skill is derived from its sources. |
+| `provenance` | `retrieved` \| `concluded` \| `asserted` | Where the content came from (v6.6.2): an external source, the system's own reasoning or write-up, or a direct statement by the human. Set at write time, inherited by extracted facts, reported on recall and never scored on. Indexed as a tag on every writable namespace. Backfilled on upgrade: articles `retrieved`, preferences and project context entries `asserted`, extracted facts their source's class, everything else — including every episodic memory — `concluded` (a deliberate, uncomfortable default: honest about who wrote it, and reclassifiable with `set_provenance`). Read paths resolve a missing value the same way (`effective_provenance`), so a record a lagging writer left unstamped still reports something honest; the same applies to `licence` (`effective_licence`). Independent of `licence`: a retrieved article can be open or restricted. |
+| `licence_note` | string, max 200 chars | Optional detail alongside `licence`: the specific identifier (`OGL v3.0`, `CC BY 4.0`) or where it was checked. Written as `""` when a reclassification clears it. |
 
 ## Lifecycle states
 

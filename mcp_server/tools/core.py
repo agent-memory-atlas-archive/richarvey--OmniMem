@@ -14,7 +14,11 @@ from memory.contradiction import check_contradiction_heuristic
 from memory.dedup import check_duplicate, find_all_duplicates
 from memory.enrichment import enqueue, enqueue_batch
 from memory.embedder import Embedder
+from memory.classification import classification_fields
+from memory.licence import LICENCE_UNKNOWN, licence_for_write
 from memory.lifecycle import MemoryLifecycle, MemoryState
+from memory.project_domains import resolve_projects_for_domains
+from memory.provenance import provenance_for_write
 from memory.recall import RecallPipeline
 from memory.store import ValkeyStore
 from memory.tags import MAX_TAGS, MAX_TAG_LENGTH, retag_memory, validate_tags as _validate_tags
@@ -88,6 +92,37 @@ def _resolve_mode(mode: str | None) -> str:
     return mode
 
 
+def _licence_notice(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """A trailing notice listing results whose licence is still unknown.
+
+    Unknown means nobody has said whether the source may be redistributed.
+    Surfacing it at recall time — when the human has the content in front
+    of them — is how those records get classified; a periodic audit never
+    happens.
+    """
+    # Only stored records count: abandoned-approach warnings and other
+    # synthetic rows carry no licence of their own.
+    unclassified = [
+        e["key"] for e in entries
+        if e.get("licence") == LICENCE_UNKNOWN
+        and e.get("result_type", "memory") in ("memory", "knowledge")
+    ]
+    if not unclassified:
+        return None
+    n = len(unclassified)
+    return {
+        "result_type": "licence_notice",
+        "unclassified": unclassified,
+        "note": (
+            f"{n} result{'s' if n != 1 else ''} above "
+            f"{'have' if n != 1 else 'has'} no recorded redistribution licence. "
+            "If the human can say whether the source may be redistributed, "
+            "record it with set_licence(keys=[...], licence='open'|'restricted'), "
+            "or set_licence(feed_name=...) to classify every article from one feed."
+        ),
+    }
+
+
 def remember(
     content: str,
     project: str | None = None,
@@ -95,6 +130,8 @@ def remember(
     namespace: str = "episodic",
     force: bool = False,
     mode: str | None = None,
+    licence: str | None = None,
+    provenance: str | None = None,
 ) -> dict[str, Any]:
     """Store a memory with automatic dedup. Returns duplicate info if near-match exists; use force=True to override.
 
@@ -107,6 +144,25 @@ def remember(
         mode: 'full' (default — extract discrete facts via Claude before storing,
             routing preferences to the preference namespace) or 'raw' (store
             verbatim). Default follows the INGEST_MODE env var.
+        licence: Redistribution rights for the content — 'own' (written here:
+            a decision, a fix, a preference), 'open' (third-party under a
+            redistributable licence), 'restricted' (third-party, not
+            redistributable: paywalled, all rights reserved), or 'unknown'.
+            A recognised identifier ('cc-by-4.0', 'ogl-3.0',
+            'all-rights-reserved') is accepted and kept as a note. Defaults
+            to 'own' for episodic/project/preference and 'unknown' for
+            knowledge. Pass it explicitly whenever the content came from
+            somewhere else — an article, a document, a vendor page.
+        provenance: Where the content comes from — 'asserted' (the human
+            stated it: a preference, a rule, a fact they gave you),
+            'concluded' (your own reasoning or write-up of work done), or
+            'retrieved' (an external source: an article, documentation, a
+            search result). Defaults to 'concluded' for episodic and project
+            memories, 'asserted' for preferences, 'retrieved' for knowledge.
+            Pass
+            'asserted' when the human dictated the content — a later
+            session will treat your own conclusions as your conclusions,
+            not as independent evidence.
     """
     store, embedder, _, _ = _get_deps()
 
@@ -115,6 +171,8 @@ def remember(
     _validate_project_name(project)
     _validate_tags(tags)
     mode = _resolve_mode(mode)
+    licence_data = licence_for_write(licence, namespace)
+    provenance_class = provenance_for_write(provenance, namespace)
 
     # Full mode: store raw immediately, then enqueue for background
     # fact extraction. Caller gets instant response; enrichment worker
@@ -166,6 +224,8 @@ def remember(
         "created_at": now,
         "updated_at": now,
         "tags": json.dumps(tags or []),
+        **licence_data,
+        "provenance": provenance_class,
     }
     if project:
         fields["project"] = project
@@ -180,9 +240,13 @@ def remember(
 
     # Enqueue for background fact extraction if full mode
     if _enrich_after:
-        enqueue(store, key, namespace, project=project, tags=tags, created_at=now)
+        enqueue(store, key, namespace, project=project, tags=tags, created_at=now,
+                classification={**licence_data, "provenance": provenance_class})
 
-    result: dict[str, Any] = {"key": key, "namespace": namespace}
+    result: dict[str, Any] = {
+        "key": key, "namespace": namespace, "licence": licence_data["licence"],
+        "provenance": provenance_class,
+    }
     if _enrich_after:
         result["enrichment"] = "queued"
     if contradiction_warning:
@@ -198,6 +262,8 @@ def remember_document(
     namespace: str = "episodic",
     chunk_size: int | None = None,
     mode: str | None = None,
+    licence: str | None = None,
+    provenance: str | None = None,
 ) -> dict[str, Any]:
     """Index a long-form document by splitting it into chunks and storing each chunk as a memory.
 
@@ -213,6 +279,15 @@ def remember_document(
         tags: Categorisation tags applied to every chunk.
         namespace: 'episodic' (default), 'project', or 'knowledge'.
         chunk_size: Words per chunk for fixed_tokens strategy (default 200).
+        licence: Redistribution rights, applied to every chunk — see remember().
+            Documents are the write most likely to be someone else's work, so
+            say where it came from: 'restricted' for a paywalled or all-rights-
+            reserved source, 'open' (or its identifier, e.g. 'ogl-3.0') for a
+            redistributable one. Defaults to 'own' outside the knowledge
+            namespace and 'unknown' inside it.
+        provenance: 'retrieved' for a document from elsewhere, 'asserted'
+            for one the human wrote, 'concluded' for your own output — see
+            remember(). Applied to every chunk.
     """
     store, embedder, _, _ = _get_deps()
 
@@ -221,6 +296,8 @@ def remember_document(
     _validate_project_name(project)
     _validate_tags(tags)
     mode = _resolve_mode(mode)
+    licence_data = licence_for_write(licence, namespace)
+    provenance_class = provenance_for_write(provenance, namespace)
     if chunk_strategy not in CHUNK_STRATEGIES:
         raise ValueError(
             f"Invalid chunk_strategy '{chunk_strategy}'. "
@@ -262,6 +339,8 @@ def remember_document(
             "doc_id": doc_id,
             "chunk_index": str(idx),
             "chunk_strategy": chunk_strategy,
+            **licence_data,
+            "provenance": provenance_class,
         }
         if project:
             fields["project"] = project
@@ -276,13 +355,15 @@ def remember_document(
             enqueue_batch(
                 store, keys, combined, namespace,
                 project=project, tags=tags, doc_id=doc_id, created_at=now,
+                classification={**licence_data, "provenance": provenance_class},
             )
             logger.info("Enqueued batch enrichment for doc_id=%s (%d chunks)", doc_id, len(keys))
         else:
             # One enrichment job per chunk
             for k in keys:
                 enqueue(store, k, namespace, project=project, tags=tags,
-                        doc_id=doc_id, created_at=now)
+                        doc_id=doc_id, created_at=now,
+                        classification={**licence_data, "provenance": provenance_class})
             logger.info("Enqueued %d enrichment jobs for doc_id=%s", len(keys), doc_id)
 
     logger.info(
@@ -297,8 +378,86 @@ def remember_document(
         "duplicates_skipped": skipped,
         "namespace": namespace,
         "mode": mode,
+        "licence": licence_data["licence"],
+        "provenance": provenance_class,
         "enrichment": "batch_queued" if (_enrich_after and _batch_mode) else ("queued" if _enrich_after else "none"),
     }
+
+
+def _resolve_recall_scope(
+    project_filter: str | None,
+    domain_filter: list[str] | str | None,
+) -> tuple[list[str], dict[str, Any] | None, bool]:
+    """Turn project and/or domain filters into the project list recall takes.
+
+    Returns (projects, notice, empty_scope). The notice is the honest-reporting
+    half: a domain nobody has declared must not quietly become an unscoped
+    search presented as a scoped one. empty_scope is the other half — the
+    pipeline reads an empty project list as "search everything", so a scope
+    that legitimately resolves to no projects has to short-circuit here rather
+    than fall through into a global search.
+    """
+    store, _, _, _ = _get_deps()
+
+    if project_filter:
+        _validate_project_name(project_filter)
+    if not domain_filter:
+        return ([project_filter] if project_filter else []), None, False
+
+    resolution = resolve_projects_for_domains(store, domain_filter)
+    projects = resolution.projects
+
+    if project_filter:
+        # Both filters given: intersect. An empty intersection is a real
+        # answer (that project isn't in that domain), not a degradation — so
+        # it returns nothing rather than widening to every project.
+        projects = [p for p in projects if p == project_filter]
+        if not projects:
+            return [], {
+                "result_type": "domain_filter_notice",
+                "domain_filter": resolution.requested,
+                "project_filter": project_filter,
+                "applied": True,
+                "projects": [],
+                "note": (
+                    f"Project '{project_filter}' does not declare "
+                    + ("this domain" if len(resolution.requested) == 1
+                       else "any of these domains")
+                    + ", so nothing matches both filters."
+                ),
+            }, True
+
+    notice: dict[str, Any] | None = None
+    if resolution.fully_unmatched:
+        notice = {
+            "result_type": "domain_filter_notice",
+            "domain_filter": resolution.requested,
+            "unmatched_domains": resolution.unmatched,
+            "applied": False,
+            "note": (
+                "No project declares "
+                + ("this domain" if len(resolution.unmatched) == 1
+                   else "any of these domains")
+                + ", so the domain filter was not applied and these results "
+                "span every project. Run compile_project_domains(project_name) "
+                "or list_projects(domain=...) to see what is declared."
+            ),
+        }
+        projects = []
+    elif resolution.unmatched:
+        notice = {
+            "result_type": "domain_filter_notice",
+            "domain_filter": resolution.requested,
+            "unmatched_domains": resolution.unmatched,
+            "applied": True,
+            "projects": projects,
+            "note": (
+                "Filtered on the domains that matched; no project declares "
+                + ", ".join(resolution.unmatched) + "."
+            ),
+        }
+
+    return projects, notice, False
 
 
 def recall(
@@ -307,16 +466,36 @@ def recall(
     namespaces: list[str] | None = None,
     project_filter: str | None = None,
     expand_queries: bool | None = None,
+    domain_filter: list[str] | str | None = None,
 ) -> list[dict[str, Any]]:
     """Search memories by semantic similarity. Returns ranked results; abandoned-approach warnings appear first.
+
+    Every result carries its `licence` and `provenance`. When any result's
+    licence is still unknown, a trailing entry with result_type
+    'licence_notice' (no key) lists them so the human can classify.
+
+    top_k is a ceiling, not a quota. Results below the relevance floor
+    (RECALL_MIN_SCORE, default 0.15) are dropped instead of padding the list,
+    so fewer results than you asked for — including none — is a normal answer.
+
+    A result flagged `weak_match` scored inside the band where relevant and
+    irrelevant results genuinely overlap on this model. Read it, but do not
+    build on it and do not go looking for a connection to the query: if it
+    is not obviously about what you asked, it isn't.
 
     Args:
         query: What you're looking for.
         top_k: Max results (default 5).
-        namespaces: Namespaces to search ('episodic', 'project', 'knowledge'). All by default.
+        namespaces: Namespaces to search ('episodic', 'project', 'knowledge',
+            'preference'). All four by default.
         project_filter: Restrict to a project.
         expand_queries: If True, generate alternative phrasings via Claude Haiku and union
             the results. Default follows the RECALL_EXPAND_QUERIES env var.
+        domain_filter: Restrict to every project declaring these work-type
+            domains (e.g. 'python') — the cross-project search. Combines with
+            project_filter as an intersection. If no project declares the
+            domain, the search runs unscoped and says so in a leading
+            'domain_filter_notice' entry.
     """
     _, _, _, pipeline = _get_deps()
 
@@ -324,18 +503,24 @@ def recall(
     if namespaces:
         for ns in namespaces:
             _validate_namespace(ns)
-    if project_filter:
-        _validate_project_name(project_filter)
+
+    projects, notice, empty_scope = _resolve_recall_scope(
+        project_filter, domain_filter
+    )
+    if empty_scope:
+        return [notice] if notice is not None else []
 
     results = pipeline.recall(
         query=query,
         namespaces=namespaces,
         top_k=top_k,
-        project_filter=project_filter,
+        project_filter=projects,
         expand_queries=expand_queries,
     )
 
     output: list[dict[str, Any]] = []
+    if notice is not None:
+        output.append(notice)
     for r in results:
         # Build compact result — only include non-empty/non-default fields
         entry: dict[str, Any] = {
@@ -349,6 +534,8 @@ def recall(
             entry["project"] = r.project
         if r.result_type != "memory":
             entry["result_type"] = r.result_type
+        if r.weak_match:
+            entry["weak_match"] = True
         if r.tags:
             entry["tags"] = r.tags
         if r.reinstate_candidate:
@@ -369,8 +556,17 @@ def recall(
             entry["event_date"] = r.event_date
         if r.enriched_from:
             entry["enriched_from"] = r.enriched_from
+        if r.licence:
+            entry["licence"] = r.licence
+        if r.licence_note:
+            entry["licence_note"] = r.licence_note
+        if r.provenance:
+            entry["provenance"] = r.provenance
         output.append(entry)
 
+    notice = _licence_notice(output)
+    if notice is not None:
+        output.append(notice)
     return output
 
 
@@ -381,8 +577,13 @@ def recall_index(
     project_filter: str | None = None,
     snippet_length: int = 150,
     expand_queries: bool | None = None,
+    domain_filter: list[str] | str | None = None,
 ) -> dict[str, Any]:
     """Lightweight recall: returns ranked summaries without full content. Use recall_detail() to fetch full content for selected keys.
+
+    Shares recall()'s relevance floor (RECALL_MIN_SCORE, default 0.15) and
+    its `weak_match` flag, so top_k is a ceiling and a short or empty result
+    set is a real answer.
 
     Args:
         query: What you're looking for.
@@ -390,6 +591,11 @@ def recall_index(
         namespaces: Namespaces to search. All by default.
         project_filter: Restrict to a project.
         snippet_length: Content preview length in chars (default 150).
+        expand_queries: If True, generate alternative phrasings via Claude Haiku
+            and union the results.
+        domain_filter: Restrict to every project declaring these work-type
+            domains (e.g. 'python'). Reports back under 'domain_filter' when a
+            requested domain matches no project.
     """
     _, _, _, pipeline = _get_deps()
 
@@ -397,8 +603,16 @@ def recall_index(
     if namespaces:
         for ns in namespaces:
             _validate_namespace(ns)
-    if project_filter:
-        _validate_project_name(project_filter)
+
+    projects, notice, empty_scope = _resolve_recall_scope(
+        project_filter, domain_filter
+    )
+    if empty_scope:
+        return {
+            "results": [],
+            "token_estimate": {"index": 0, "full": 0},
+            "domain_filter": notice,
+        }
 
     snippet_length = max(50, min(snippet_length, 500))
 
@@ -406,7 +620,7 @@ def recall_index(
         query=query,
         namespaces=namespaces,
         top_k=top_k,
-        project_filter=project_filter,
+        project_filter=projects,
         expand_queries=expand_queries,
     )
 
@@ -433,19 +647,38 @@ def recall_index(
             entry["project"] = r.project
         if r.result_type != "memory":
             entry["result_type"] = r.result_type
+        if r.weak_match:
+            entry["weak_match"] = True
         if r.tags:
             entry["tags"] = r.tags
         if r.reinstate_candidate:
             entry["reinstate_candidate"] = True
+        if r.licence:
+            entry["licence"] = r.licence
+        if r.provenance:
+            entry["provenance"] = r.provenance
 
         index_tokens = len(snippet) // 4 + 10  # snippet + metadata overhead
         total_index_tokens += index_tokens
         output.append(entry)
 
-    return {
+    payload: dict[str, Any] = {
         "results": output,
         "token_estimate": {"index": total_index_tokens, "full": total_full_tokens},
     }
+    licence_notice = _licence_notice(output)
+    if licence_notice is not None:
+        payload["licence_notice"] = licence_notice
+    if notice is not None:
+        payload["domain_filter"] = notice
+    elif projects and domain_filter:
+        payload["domain_filter"] = {
+            "domain_filter": domain_filter
+            if isinstance(domain_filter, list) else [domain_filter],
+            "applied": True,
+            "projects": projects,
+        }
+    return payload
 
 
 def recall_detail(
@@ -489,6 +722,7 @@ def recall_detail(
                 pass
         if data.get("source_url"):
             entry["source_url"] = data["source_url"]
+        entry.update(classification_fields(data, entry["namespace"], key))
         if data.get("breakthrough"):
             entry["breakthrough"] = data["breakthrough"]
         if data.get("effort_score"):

@@ -26,6 +26,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from memory.store import ValkeyStore
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 # The worker modules import each other as top-level modules (they run with
@@ -358,6 +360,11 @@ class _FakeHealthClient:
 
 
 class _FakeHealthStore:
+    # Borrows the real index_report so these tests exercise the shipped
+    # comparison rather than a copy of it — health(), briefing() and the
+    # startup check all go through this one method (issue #28).
+    index_report = ValkeyStore.index_report
+
     def __init__(self, client, counts):
         self._client = client
         self.client = client
@@ -643,6 +650,7 @@ class TestWorkerMain:
     def test_main_wires_scheduler_and_watcher(self, monkeypatch, worker):
         calls = []
         monkeypatch.setattr(worker, "_wait_for_valkey", lambda: calls.append("wait"))
+        monkeypatch.setattr(worker, "_get_embedder", lambda: calls.append("model"))
         monkeypatch.setattr(worker, "run_ingestion", lambda: calls.append("ingest"))
         monkeypatch.setenv("RSS_SCHEDULE_HOURS", "2")
 
@@ -663,7 +671,7 @@ class TestWorkerMain:
 
         worker.main()
 
-        assert calls == ["wait", "ingest"]
+        assert calls == ["wait", "model", "ingest"]
         scheduler.add_job.assert_called_once_with(
             worker.run_ingestion,
             "interval",

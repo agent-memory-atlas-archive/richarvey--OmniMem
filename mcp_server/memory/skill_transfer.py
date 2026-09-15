@@ -12,7 +12,7 @@ travel: embeddings are regenerated on the importing instance, so bundles stay
 portable across embedding models and instances.
 
 Format version 2 adds an optional feeds.json: the RSS feeds that influence
-the exported skill's domain (name, url, topics, mode, project, and the
+the exported skill's domain (name, url, topics, mode, project, licence, and the
 influence score), so the receiving instance can keep the skill fed. The same
 additive rule applies on import: a feed already in the reading list (matched
 by URL) is never rewritten — at most it gains the bundled influence entry it
@@ -32,6 +32,8 @@ import zipfile
 from typing import Any
 
 from .feed_influence import load_feed_influences, validate_feed_skills
+from .licence import LICENCE_OPEN, LICENCE_RESTRICTED, LICENCE_UNKNOWN, MAX_LICENCE_NOTE, resolve_licence
+from .provenance import PROVENANCE_CLASSES, default_provenance
 from .skills import (
     SKILL_KEY_PREFIX,
     discovery_text,
@@ -206,6 +208,10 @@ def _influencing_feeds(store, domain: str) -> list[dict[str, Any]]:
             feed["mode"] = entry["mode"]
         if entry.get("project"):
             feed["project"] = entry["project"]
+        if entry.get("licence"):
+            feed["licence"] = entry["licence"]
+            if entry.get("licence_note"):
+                feed["licence_note"] = entry["licence_note"]
         feeds.append(feed)
     return feeds
 
@@ -311,6 +317,25 @@ def _validate_feeds(
                 return [], f"{label} has an invalid project label"
             if project:
                 feed["project"] = project
+        licence = entry.get("licence")
+        if licence is not None:
+            # A feed's declared licence travels so articles ingested on the
+            # receiving side arrive classified. It must resolve — an
+            # unrecognised value would silently ingest as unknown there.
+            try:
+                if not isinstance(licence, str):
+                    raise ValueError
+                resolve_licence(licence)
+            except ValueError:
+                return [], f"{label} has an unrecognised licence"
+            if licence:
+                feed["licence"] = licence
+                note = entry.get("licence_note")
+                if note is not None:
+                    if not isinstance(note, str) or len(note) > MAX_LICENCE_NOTE:
+                        return [], f"{label} has an invalid licence note"
+                    if note:
+                        feed["licence_note"] = note
         feeds.append(feed)
     return feeds, None
 
@@ -620,6 +645,21 @@ def apply_skill_import(store, embedder, bundle: dict[str, Any]) -> dict[str, Any
             continue
         fields = dict(mem["fields"])
         fields.setdefault("state", "active")
+        # An imported memory is someone else's work by definition: a bundled
+        # "own" is the exporter's own, not ours, and a pre-6.6.1 bundle
+        # carries nothing at all. Open and restricted travel with their
+        # note; anything else — own, missing, or out of vocabulary from a
+        # hand-edited bundle — is honestly unknown.
+        if fields.get("licence") not in (LICENCE_OPEN, LICENCE_RESTRICTED):
+            fields["licence"] = LICENCE_UNKNOWN
+            fields.pop("licence_note", None)
+        # Provenance travels with the memory; a pre-6.6.2 bundle carries
+        # none, and the namespace default is the honest reading of what
+        # the exporting instance would have stamped.
+        # An out-of-vocabulary value from a hand-edited or forked bundle
+        # would be stored forever and match no filter; fall back instead.
+        if fields.get("provenance") not in PROVENANCE_CLASSES:
+            fields["provenance"] = default_provenance(key.split(":")[1])
         fields["imported_at"] = now
         namespace = key.split(":")[1]
         vector = embedder.embed(fields["content"])

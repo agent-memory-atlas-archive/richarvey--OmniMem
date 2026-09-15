@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+import zlib
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -260,7 +261,13 @@ class FakeEmbedder:
     def embed(self, text: str) -> np.ndarray:
         vec = np.zeros(384, dtype=np.float32)
         for word in text.lower().split():
-            rng = np.random.RandomState(hash(word) % (2**31))
+            # crc32, not hash(): Python randomises string hashes per process
+            # (PYTHONHASHSEED), so seeding on hash() gave a different vector
+            # for the same word on every run. Similarity between any two
+            # texts therefore moved run to run, which is invisible while
+            # nothing compares against a threshold and becomes flakiness the
+            # moment something does (the recall and skill relevance floors).
+            rng = np.random.RandomState(zlib.crc32(word.encode()) % (2**31))
             vec += rng.randn(384).astype(np.float32)
         norm = np.linalg.norm(vec)
         if norm > 0:
@@ -407,6 +414,21 @@ class FakeValkeyStore:
         return restored, skipped, restored_keys
 
 
+@pytest.fixture(autouse=True)
+def _clear_project_domain_cache():
+    """Drop the project domain -> project name cache between tests.
+
+    It is process-global with a TTL (one store per process in production), so
+    without this a resolution cached against one test's fake store would be
+    served to the next one.
+    """
+    from memory.project_domains import invalidate_domain_cache
+
+    invalidate_domain_cache()
+    yield
+    invalidate_domain_cache()
+
+
 @pytest.fixture
 def web_client(fake_store, fake_embedder, monkeypatch):
     """Starlette TestClient over the real web UI app, backed by the fakes.
@@ -445,6 +467,23 @@ def fake_store():
 @pytest.fixture
 def fake_embedder():
     return FakeEmbedder()
+
+
+@pytest.fixture
+def no_relevance_floor(monkeypatch):
+    """Switch off recall's relevance floor for tests about ranking mechanics.
+
+    FakeEmbedder sums one random vector per distinct word, so similarity
+    tracks literal word overlap and nothing else: two sentences that mean the
+    same thing in different words score near zero, where all-MiniLM-L6-v2
+    would put them comfortably above the 0.4 floor. Tests that exercise
+    ordering, promotion or the temporal boost would otherwise be asserting
+    against the fake's harshness rather than the behaviour they name.
+
+    Use this only where relevance isn't the subject. Tests OF the floor use
+    the real default.
+    """
+    monkeypatch.setenv("RECALL_MIN_SCORE", "0")
 
 
 @pytest.fixture
