@@ -2,6 +2,11 @@
 All notable changes to omnimem are documented here.
 Format: [version] - date - description
 
+## [6.7.2] - Unreleased
+### Fixed
+- **A fresh install pulled in fastmcp 4 and mcp 2** (#37): `mcp_server/requirements.txt` set a floor on fastmcp and no ceiling, so CI and the Docker images resolved fastmcp 4.0.3 with mcp 2.2.0, two majors past the fastmcp 3.4.7 / mcp 1.29.0 that 6.7.1 was tested on. mcp 2 made `client_id` a required field on `OAuthClientInformationFull`, which is what failed the Test Coverage job; nothing in OmniMem had changed. Both packages are now bounded below their next major (`fastmcp<4`, `mcp<2`), stated explicitly for mcp because fastmcp doesn't declare it. Moving to fastmcp 4 is its own piece of work with its own testing. Images built from the v6.7.1 tag picked up the unbounded versions and should be rebuilt from this fix
+- **`tools/` is back at 100% line coverage**: the #34 staleness exemption shipped with two untested branches in `_skill_source_keys`, a skill whose fields come back empty and a store error while reading manifests. Both now have tests, including that a store error still leaves the briefing's stale list working
+
 ## [6.7.1] - 2026-09-08
 ### Fixed
 - **`recall()` no longer pads `top_k` with whatever is left** (#30): there was no relevance floor, so a query with two good matches and nothing else still returned five results. The run on the issue is the shape of it — two on-topic hits, then a WWDC note about Spotlight and a WCAG keyboard-operability rule, both matching on the generic tokens "search" and "index" and sharing no subject matter with the query at all. That output goes straight into an agent's context: three chunks of tokens spent, and a live risk of the agent working out how the Spotlight note is relevant, which is a worse failure than returning nothing. `RECALL_MIN_SCORE` (default `0.15`, `0` disables) is applied after ranking and before the `top_k` slice, so `top_k` is a ceiling and a short or empty result set is a normal answer that means what it says
