@@ -71,15 +71,26 @@ def _issue_tokens(provider):
 
 class TestClientRegistration:
     def test_register_and_get(self, provider):
-        client = _make_client(client_id=None)
+        # mcp 2's registration handler assigns the client_id before calling
+        # the provider, so a real registration always arrives with one.
+        client = _make_client(client_id="handler-assigned-id")
         _run(provider.register_client(client))
-        assert client.client_id is not None
-        assert client.client_id.startswith("omnimem-")
+        assert client.client_id == "handler-assigned-id"
         assert client.client_secret is not None
+        assert client.client_id_issued_at is not None
 
         retrieved = _run(provider.get_client(client.client_id))
         assert retrieved is not None
         assert retrieved.client_name == "Test Client"
+
+    def test_register_generates_an_id_when_blank(self, provider):
+        # mcp 2 strips an empty client_id at parse time, so the model can't be
+        # built without one; model_copy skips validation to reach the
+        # provider's generate-if-missing fallback.
+        client = _make_client().model_copy(update={"client_id": ""})
+        _run(provider.register_client(client))
+        assert client.client_id.startswith("omnimem-")
+        assert _run(provider.get_client(client.client_id)) is not None
 
     def test_get_unknown_client(self, provider):
         assert _run(provider.get_client("nonexistent")) is None
