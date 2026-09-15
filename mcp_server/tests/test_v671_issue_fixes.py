@@ -455,6 +455,56 @@ class TestStaleExemption:
         ]
         assert loose in stale_keys
 
+    def test_a_skill_with_no_readable_fields_is_skipped(
+        self, fake_store, fake_embedder, monkeypatch,
+    ):
+        """A skill key whose hash came back empty (deleted between the scan
+        and the read) contributes nothing, and the skills around it still
+        exempt their sources."""
+        from tools.briefing import _skill_source_keys
+
+        compiled = self._stale_memory(
+            fake_store, fake_embedder, "mem:episodic:pref3", "a durable fact",
+        )
+        self._skill(fake_store, fake_embedder, [compiled])
+        real_get = fake_store.get_fields_multi
+        monkeypatch.setattr(
+            fake_store, "scan_prefix",
+            lambda prefix: ["mem:skill:gen:gone-local",
+                            "mem:skill:gen:preferences-local"],
+        )
+        monkeypatch.setattr(
+            fake_store, "get_fields_multi",
+            lambda keys, fields: [{}] + real_get(keys[1:], fields),
+        )
+        assert _skill_source_keys(fake_store) == {compiled}
+
+    def test_a_store_error_falls_back_to_no_exemption(
+        self, fake_store, fake_embedder, monkeypatch,
+    ):
+        """If the manifests can't be read at all, the briefing keeps the
+        pre-6.7.1 behaviour rather than failing."""
+        from tools.briefing import _scan_episodic_once, _skill_source_keys
+
+        loose = self._stale_memory(
+            fake_store, fake_embedder, "mem:episodic:loose3", "an old note",
+        )
+
+        def boom(prefix):
+            raise ConnectionError("valkey went away")
+
+        real_scan = fake_store.scan_prefix
+        monkeypatch.setattr(
+            fake_store, "scan_prefix",
+            lambda prefix: boom(prefix) if prefix.startswith("mem:skill:")
+            else real_scan(prefix),
+        )
+        assert _skill_source_keys(fake_store) == set()
+        assert loose in [
+            s["key"] for s in
+            _scan_episodic_once(fake_store, stale_days=30)["stale"]
+        ]
+
 
 # ---------------------------------------------------------------------------
 # #31 — find_skills relevance floor and confidence

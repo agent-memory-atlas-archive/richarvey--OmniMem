@@ -1,4 +1,8 @@
-fastmcp>=2.13.0
+# Upper bounds are the majors this release is tested on. fastmcp 4 / mcp 2
+# changed the OAuth models (client_id became required) and an unbounded pin
+# pulled them into CI and the images unannounced (#37). Lift deliberately.
+fastmcp>=2.13.0,<4
+mcp>=1.24.0,<2
 valkey[hiredis]>=6.0.0
 onnxruntime>=1.17.0
 tokenizers>=0.15.0
